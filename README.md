@@ -88,7 +88,7 @@ We use Python protocols (PEP 544) to define type-safe interfaces for:
 ### 1. Clone and Setup
 ```bash
 # Clone repository
-git clone [<repository-url>](https://github.com/wikefjol/chalmers_graph)
+git clone https://github.com/wikefjol/chalmers_graph
 cd chalmers_graph
 
 # Create and activate virtual environment
