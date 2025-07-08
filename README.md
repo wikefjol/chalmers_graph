@@ -88,8 +88,8 @@ We use Python protocols (PEP 544) to define type-safe interfaces for:
 ### 1. Clone and Setup
 ```bash
 # Clone repository
-git clone <repository-url>
-cd demo_small_neo4j
+git clone [<repository-url>](https://github.com/wikefjol/chalmers_graph)
+cd chalmers_graph
 
 # Create and activate virtual environment
 python -m venv venv
