@@ -30,6 +30,10 @@ class BaseStreamingExtractor(ABC):
         ):
             yield batch
     
+    def set_batch_size(self, new_batch_size: int) -> None:
+        """Update batch size for this extractor"""
+        self.batch_size = new_batch_size
+    
     def extract_sample_batch(self, size: int = 100) -> List[Dict[str, Any]]:
         """Extract a single sample batch"""
         query = self.get_query()

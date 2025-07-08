@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional, Generator, Set
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
+from elasticsearch.exceptions import ConnectionTimeout, ConnectionError, TransportError
 
 from .connection import Neo4jConnection
 from .schema import SchemaManager
@@ -262,6 +263,7 @@ class StreamingImportPipeline:
         """Import a single entity type using streaming with retry logic"""
         MAX_RETRIES = 3
         RETRY_DELAY = 5  # seconds
+        INITIAL_BATCH_SIZE = extractor.batch_size
         
         for attempt in range(MAX_RETRIES):
             try:
@@ -281,15 +283,31 @@ class StreamingImportPipeline:
                 )
                 
                 print(f"  📊 Estimated total: {total_count:,} documents" if total_count else "  📊 Total count unknown")
+                if extractor.batch_size != INITIAL_BATCH_SIZE:
+                    print(f"  🔧 Using reduced batch size: {extractor.batch_size} (was {INITIAL_BATCH_SIZE})")
                 
                 items_processed = 0
                 last_successful_batch = 0
                 
+                # Track items processed across retries with different batch sizes
+                if attempt > 0:
+                    # On retry, continue from where we left off
+                    items_processed = getattr(self, '_last_processed_count', 0)
+                    print(f"  🔄 Resuming from {items_processed:,} items processed")
+                
                 # Process in batches
                 for batch_num, batch in enumerate(extractor.extract_batches(), 1):
-                    # Skip already processed batches if retrying
-                    if batch_num <= last_successful_batch:
-                        continue
+                    # Skip already processed items when retrying with different batch size
+                    if attempt > 0 and items_processed > 0:
+                        # Calculate how many batches to skip based on items already processed
+                        items_in_batch = len(batch)
+                        if items_processed >= items_in_batch:
+                            items_processed -= items_in_batch
+                            continue
+                        elif items_processed > 0:
+                            # Partial batch - skip processed items
+                            batch = batch[items_processed:]
+                            items_processed = 0
                         
                     if sample_mode and items_processed >= sample_size:
                         break
@@ -320,6 +338,8 @@ class StreamingImportPipeline:
                         
                         items_processed += len(batch)
                         last_successful_batch = batch_num
+                        # Save progress for potential retry
+                        self._last_processed_count = progress.processed_items
                     
                     # Update progress
                     print(f"\r  📈 {progress.get_progress_string()}", end='', flush=True)
@@ -329,8 +349,32 @@ class StreamingImportPipeline:
                 
                 print()  # New line after progress
                 print(f"  ✅ Imported {progress.processed_items:,} {entity_type}")
+                # Clear progress tracking on success
+                if hasattr(self, '_last_processed_count'):
+                    delattr(self, '_last_processed_count')
                 return True
                 
+            except (ConnectionTimeout, ConnectionError, TransportError) as e:
+                print(f"\n  🌐 ES timeout error: {e}")
+                
+                # Try reducing batch size for ES timeouts
+                current_batch_size = extractor.batch_size
+                if current_batch_size > 100:  # Don't go below 100
+                    new_batch_size = max(100, current_batch_size // 2)
+                    print(f"  🔧 Reducing ES batch size: {current_batch_size} → {new_batch_size}")
+                    extractor.set_batch_size(new_batch_size)
+                    
+                    if attempt < MAX_RETRIES - 1:
+                        print(f"  ⏳ Retrying with smaller batch size in {RETRY_DELAY} seconds...")
+                        time.sleep(RETRY_DELAY)
+                        continue
+                else:
+                    print(f"  ❌ Cannot reduce batch size further (already at {current_batch_size})")
+                
+                if attempt == MAX_RETRIES - 1:
+                    print(f"\n  ❌ ES timeout error importing {entity_type} after {MAX_RETRIES} attempts")
+                    return False
+                    
             except Exception as e:
                 print(f"\n  ⚠️ Attempt {attempt + 1}/{MAX_RETRIES} failed for {entity_type}: {e}")
                 if attempt < MAX_RETRIES - 1:
