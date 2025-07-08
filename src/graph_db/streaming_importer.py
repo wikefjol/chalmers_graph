@@ -730,6 +730,44 @@ class StreamingImportPipeline:
         # In production, you might want to use a Bloom filter or query Neo4j
         return True  # For now, attempt all relationships
     
+    def _extract_unified_keywords(self, doc: Dict[str, Any], entity_type: str) -> List[str]:
+        """Extract and merge all keyword-like fields into ALL CAPS list"""
+        all_keywords = []
+        
+        if entity_type in ['publications', 'projects']:
+            # Extract Keywords (simple array of objects with Value field) - mainly for publications
+            keywords = doc.get('Keywords', [])
+            for keyword in keywords:
+                if isinstance(keyword, dict) and 'Value' in keyword:
+                    value = keyword['Value'].strip()
+                    if value:
+                        all_keywords.append(value.upper())
+            
+            # Extract Categories (complex objects with Swedish and English names)
+            categories = doc.get('Categories', [])
+            for category in categories:
+                if isinstance(category, dict):
+                    # Handle different category structures between Publications and Projects
+                    if entity_type == 'projects':
+                        # Projects have: {CategoryID: "...", Category: {NameSwe: "...", NameEng: "..."}}
+                        category_obj = category.get('Category', {})
+                    else:
+                        # Publications have: {NameSwe: "...", NameEng: "...", Type: {...}}
+                        category_obj = category
+                    
+                    # Extract Swedish name
+                    name_swe = category_obj.get('NameSwe', '')
+                    if name_swe:
+                        all_keywords.append(name_swe.strip().upper())
+                    
+                    # Extract English name
+                    name_eng = category_obj.get('NameEng', '')
+                    if name_eng:
+                        all_keywords.append(name_eng.strip().upper())
+        
+        # Remove duplicates and sort
+        return sorted(list(set(all_keywords)))
+    
     def _format_document(self, doc_type: str, doc: Dict[str, Any]) -> Dict[str, Any]:
         """Format Elasticsearch document for Neo4j import"""
         try:
@@ -825,11 +863,10 @@ class StreamingImportPipeline:
         else:
             formatted['source'] = str(source)
         
-        # Handle simple arrays as JSON (keywords, categories)
-        for field in ['Keywords', 'Categories']:
-            value = doc.get(field, [])
-            if value:
-                formatted[f'{field.lower()}_json'] = json.dumps(value)
+        # Extract unified keywords from Keywords and Categories fields
+        keywords = self._extract_unified_keywords(doc, 'publications')
+        formatted['keywords'] = keywords
+        formatted['keywords_count'] = len(keywords)
         
         # DON'T store relationship data (Persons, Organizations, Series, Project) on nodes
         # These will be processed directly from ES documents during relationship phase
@@ -849,11 +886,10 @@ class StreamingImportPipeline:
             'publish_status': doc.get('PublishStatus', 0),
         }
         
-        # Handle simple arrays as JSON  
-        for field in ['Keywords', 'Categories']:
-            value = doc.get(field, [])
-            if value:
-                formatted[f'{field.lower()}_json'] = json.dumps(value)
+        # Extract unified keywords from Categories field (projects don't typically have Keywords)
+        keywords = self._extract_unified_keywords(doc, 'projects')
+        formatted['keywords'] = keywords
+        formatted['keywords_count'] = len(keywords)
         
         # DON'T store relationship data (Persons, Organizations) on project nodes
         
