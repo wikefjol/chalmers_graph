@@ -7,7 +7,7 @@ import sys
 import argparse
 import json
 import time
-from typing import Dict, Any
+from typing import Dict, Any, List
 sys.path.append('src')
 
 from graph_db.connection import Neo4jConnection
@@ -743,6 +743,44 @@ class Neo4jCLI:
             traceback.print_exc()
             return {}
     
+    def _extract_unified_keywords(self, doc: Dict[str, Any], entity_type: str) -> List[str]:
+        """Extract and merge all keyword-like fields into ALL CAPS list"""
+        all_keywords = []
+        
+        if entity_type in ['publications', 'projects']:
+            # Extract Keywords (simple array of objects with Value field) - mainly for publications
+            keywords = doc.get('Keywords', [])
+            for keyword in keywords:
+                if isinstance(keyword, dict) and 'Value' in keyword:
+                    value = keyword['Value'].strip()
+                    if value:
+                        all_keywords.append(value.upper())
+            
+            # Extract Categories (complex objects with Swedish and English names)
+            categories = doc.get('Categories', [])
+            for category in categories:
+                if isinstance(category, dict):
+                    # Handle different category structures between Publications and Projects
+                    if entity_type == 'projects':
+                        # Projects have: {CategoryID: "...", Category: {NameSwe: "...", NameEng: "..."}}
+                        category_obj = category.get('Category', {})
+                    else:
+                        # Publications have: {NameSwe: "...", NameEng: "...", Type: {...}}
+                        category_obj = category
+                    
+                    # Extract Swedish name
+                    name_swe = category_obj.get('NameSwe', '')
+                    if name_swe:
+                        all_keywords.append(name_swe.strip().upper())
+                    
+                    # Extract English name
+                    name_eng = category_obj.get('NameEng', '')
+                    if name_eng:
+                        all_keywords.append(name_eng.strip().upper())
+        
+        # Remove duplicates and sort
+        return sorted(list(set(all_keywords)))
+    
     def _format_document(self, doc_type: str, doc: Dict[str, Any]) -> Dict[str, Any]:
         """Format Elasticsearch document for Neo4j import"""
         if doc_type == 'persons':
@@ -778,6 +816,8 @@ class Neo4jCLI:
             }
         
         elif doc_type == 'publications':
+            # Extract unified keywords
+            keywords = self._extract_unified_keywords(doc, 'publications')
             return {
                 'es_id': doc.get('Id', ''),
                 'title': doc.get('Title', ''),
@@ -787,8 +827,8 @@ class Neo4jCLI:
                 'source': doc.get('Source', ''),
                 'is_draft': doc.get('IsDraft', False),
                 'is_deleted': doc.get('IsDeleted', False),
-                'keywords': json.dumps(doc.get('Keywords', [])),
-                'categories': json.dumps(doc.get('Categories', [])),
+                'keywords': keywords,
+                'keywords_count': len(keywords),
                 # Keep these for relationship extraction (note the capitalization)
                 'persons': doc.get('Persons', []),
                 'organizations': doc.get('Organizations', []),
@@ -797,6 +837,8 @@ class Neo4jCLI:
             }
         
         elif doc_type == 'projects':
+            # Extract unified keywords
+            keywords = self._extract_unified_keywords(doc, 'projects')
             return {
                 'es_id': str(doc.get('ID', '')),
                 'title_swe': doc.get('ProjectTitleSwe', ''),
@@ -806,8 +848,8 @@ class Neo4jCLI:
                 'start_date': doc.get('StartDate', ''),
                 'end_date': doc.get('EndDate', ''),
                 'publish_status': doc.get('PublishStatus', 0),
-                'keywords': json.dumps(doc.get('Keywords', [])),
-                'categories': json.dumps(doc.get('Categories', [])),
+                'keywords': keywords,
+                'keywords_count': len(keywords),
                 # Keep these for relationship extraction (note the capitalization)
                 'persons': doc.get('Persons', []),
                 'organizations': doc.get('Organizations', [])
