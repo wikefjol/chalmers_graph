@@ -5,6 +5,7 @@ Handles large datasets without loading all data into memory
 
 import time
 import json
+import os
 from typing import Dict, List, Any, Optional, Generator, Set
 from datetime import datetime
 from dataclasses import dataclass
@@ -98,6 +99,51 @@ class StreamingImportPipeline:
         self.db_manager = DatabaseManager(connection)
         self.import_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.node_id_cache = {}  # Cache for relationship validation
+        self.checkpoint_file = f"data/import_checkpoint_{self.import_session_id}.json"
+    
+    def _save_checkpoint(self, completed_entities: List[str], current_entity: str = None, 
+                        processed_items: int = 0):
+        """Save progress checkpoint"""
+        checkpoint_data = {
+            'session_id': self.import_session_id,
+            'timestamp': datetime.now().isoformat(),
+            'completed_entities': completed_entities,
+            'current_entity': current_entity,
+            'processed_items': processed_items
+        }
+        
+        # Ensure data directory exists
+        os.makedirs('data', exist_ok=True)
+        
+        try:
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+            print(f"    💾 Checkpoint saved: {len(completed_entities)} entities completed")
+        except Exception as e:
+            print(f"    ⚠️ Failed to save checkpoint: {e}")
+    
+    def _load_checkpoint(self) -> Optional[Dict]:
+        """Load progress checkpoint if exists"""
+        if not os.path.exists(self.checkpoint_file):
+            return None
+        
+        try:
+            with open(self.checkpoint_file, 'r') as f:
+                checkpoint_data = json.load(f)
+            print(f"    📂 Checkpoint loaded: {len(checkpoint_data['completed_entities'])} entities completed")
+            return checkpoint_data
+        except Exception as e:
+            print(f"    ⚠️ Failed to load checkpoint: {e}")
+            return None
+    
+    def _cleanup_checkpoint(self):
+        """Remove checkpoint file on successful completion"""
+        try:
+            if os.path.exists(self.checkpoint_file):
+                os.remove(self.checkpoint_file)
+                print(f"    🧹 Checkpoint cleaned up")
+        except Exception as e:
+            print(f"    ⚠️ Failed to cleanup checkpoint: {e}")
     
     def run_streaming_import(self, extractors: Dict[str, BaseStreamingExtractor], 
                            enable_relationships: bool = True,
@@ -124,8 +170,32 @@ class StreamingImportPipeline:
         pipeline_start = time.time()
         overall_success = True
         
-        # Phase 1: Schema Setup
-        print("🏗️ Phase 1: Schema Setup")
+        # Check for existing checkpoint (only for full imports)
+        completed_entities = []
+        if not sample_mode:
+            checkpoint = self._load_checkpoint()
+            if checkpoint:
+                completed_entities = checkpoint.get('completed_entities', [])
+                if completed_entities:
+                    print(f"🔄 Resuming import from checkpoint: {len(completed_entities)} entities already completed")
+        
+        # Phase 1: Pre-import checks
+        print("🏗️ Phase 1: Pre-import Setup")
+        
+        # Check ES cluster health (only for full imports)
+        if not sample_mode:
+            print("  🔍 Checking ES cluster health...")
+            # Get ES client from any extractor
+            es_client = next(iter(extractors.values())).es_client
+            if hasattr(es_client, 'is_cluster_ready_for_import'):
+                if not es_client.is_cluster_ready_for_import():
+                    print("❌ ES cluster not ready for import, aborting")
+                    return False
+            else:
+                print("  ⚠️ ES health check not available, proceeding anyway")
+        
+        # Setup Neo4j schema
+        print("  🗂️ Setting up Neo4j schema...")
         if not self.schema_manager.setup_schema():
             print("❌ Schema setup failed, aborting import")
             return False
@@ -145,6 +215,11 @@ class StreamingImportPipeline:
                 print(f"⚠️ No {extractor_key} extractor provided, skipping")
                 continue
             
+            # Skip if already completed according to checkpoint
+            if extractor_key in completed_entities:
+                print(f"✅ {emoji} {node_label} nodes already completed (checkpoint)")
+                continue
+            
             print(f"{emoji} Importing {node_label} nodes")
             success = self._import_entity_stream(
                 extractor_key,
@@ -154,6 +229,24 @@ class StreamingImportPipeline:
                 sample_size
             )
             overall_success &= success
+            
+            # Save checkpoint after each successful entity (only for full imports)
+            if success and not sample_mode:
+                completed_entities.append(extractor_key)
+                self._save_checkpoint(completed_entities, current_entity=None)
+                
+                # Sequential processing safeguards
+                if extractor_key != 'publications':  # Don't delay after last entity
+                    # Clean up any lingering scroll contexts between entity types
+                    es_client = extractors[extractor_key].es_client
+                    if hasattr(es_client, 'clear_all_scroll_contexts'):
+                        print("  🧹 Cleaning up scroll contexts between entity types...")
+                        es_client.clear_all_scroll_contexts()
+                    
+                    # Add delay between entity types to reduce ES pressure
+                    print(f"  ⏳ Waiting 5 seconds before next entity type...")
+                    time.sleep(5)
+            
             print()
         
         # Phase 7: Import relationships
@@ -185,76 +278,14 @@ class StreamingImportPipeline:
         
         if overall_success:
             print("✅ Streaming import pipeline completed successfully!")
+            # Clean up checkpoint on successful completion
+            if not sample_mode:
+                self._cleanup_checkpoint()
         else:
             print("⚠️ Streaming import pipeline completed with warnings/errors")
         
         return overall_success
     
-    def _import_entity_stream(self, entity_type: str, node_label: str, 
-                            extractor: BaseStreamingExtractor,
-                            sample_mode: bool, sample_size: int) -> bool:
-        """Import a single entity type using streaming"""
-        try:
-            # Get total count if available (for progress tracking)
-            total_count = None
-            if hasattr(extractor.es_client, 'count_documents'):
-                total_count = extractor.es_client.count_documents(extractor.index_name)
-                if sample_mode and total_count > sample_size:
-                    total_count = sample_size
-            
-            progress = StreamingProgress(
-                phase=ImportPhase(entity_type.lower() if entity_type.lower() in [e.value for e in ImportPhase] else 'organization'),
-                entity_type=entity_type,
-                total_items=total_count,
-                processed_items=0,
-                start_time=time.time()
-            )
-            
-            print(f"  📊 Estimated total: {total_count:,} documents" if total_count else "  📊 Total count unknown")
-            
-            items_processed = 0
-            
-            # Process in batches
-            for batch_num, batch in enumerate(extractor.extract_batches(), 1):
-                if sample_mode and items_processed >= sample_size:
-                    break
-                
-                # Limit batch if in sample mode
-                if sample_mode and items_processed + len(batch) > sample_size:
-                    batch = batch[:sample_size - items_processed]
-                
-                progress.current_batch = batch_num
-                
-                # Format documents for Neo4j
-                formatted_batch = []
-                for doc in batch:
-                    formatted_doc = self._format_document(entity_type, doc)
-                    if formatted_doc:
-                        formatted_batch.append(formatted_doc)
-                        # Cache ID for relationship processing
-                        self._cache_node_id(entity_type, formatted_doc['es_id'])
-                
-                # Import batch to Neo4j
-                if formatted_batch:
-                    imported = self._import_nodes_batch(node_label, formatted_batch)
-                    progress.processed_items += imported
-                    items_processed += len(batch)
-                
-                # Update progress
-                print(f"\r  📈 {progress.get_progress_string()}", end='', flush=True)
-                
-                if sample_mode and items_processed >= sample_size:
-                    break
-            
-            print()  # New line after progress
-            print(f"  ✅ Imported {progress.processed_items:,} {entity_type}")
-            return True
-            
-        except Exception as e:
-            print(f"\n  ❌ Error importing {entity_type}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
     
 
     def _import_entity_stream(self, entity_type: str, node_label: str, 
@@ -344,6 +375,19 @@ class StreamingImportPipeline:
                     # Update progress
                     print(f"\r  📈 {progress.get_progress_string()}", end='', flush=True)
                     
+                    # Add inter-batch delay to reduce ES pressure (skip for sample mode)
+                    if not sample_mode and batch_num > 1:
+                        # Adaptive delay based on entity type complexity
+                        delay_map = {
+                            'organizations': 1.0,  # Simple docs
+                            'persons': 2.0,        # Medium complexity
+                            'serials': 1.0,        # Simple docs
+                            'projects': 3.0,       # Complex nested data
+                            'publications': 2.0    # Medium complexity
+                        }
+                        delay = delay_map.get(entity_type, 2.0)
+                        time.sleep(delay)
+                    
                     if sample_mode and items_processed >= sample_size:
                         break
                 
@@ -356,6 +400,11 @@ class StreamingImportPipeline:
                 
             except (ConnectionTimeout, ConnectionError, TransportError) as e:
                 print(f"\n  🌐 ES timeout error: {e}")
+                
+                # Clean up any lingering scroll contexts
+                if hasattr(extractor, 'es_client') and hasattr(extractor.es_client, 'clear_all_scroll_contexts'):
+                    print("  🧹 Cleaning up scroll contexts...")
+                    extractor.es_client.clear_all_scroll_contexts()
                 
                 # Try reducing batch size for ES timeouts
                 current_batch_size = extractor.batch_size

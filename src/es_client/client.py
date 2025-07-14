@@ -114,10 +114,82 @@ class ElasticsearchClient:
                     scroll_id=scroll_id,
                     scroll=scroll_timeout
                 )
+        except Exception as e:
+            # Log error but don't re-raise immediately - cleanup first
+            print(f"    ⚠️ ES scroll error: {e}")
+            raise
         finally:
-            # Clean up scroll context
-            self.client.clear_scroll(scroll_id=scroll_id)
+            # Always clean up scroll context, even on errors
+            try:
+                self.client.clear_scroll(scroll_id=scroll_id)
+            except Exception as cleanup_error:
+                # Don't let cleanup errors mask original errors
+                print(f"    ⚠️ Failed to cleanup scroll context: {cleanup_error}")
+                pass
     
+    def clear_all_scroll_contexts(self) -> bool:
+        """Clear all active scroll contexts - useful for cleanup after errors"""
+        try:
+            result = self.client.clear_scroll(scroll_id="_all")
+            print(f"    ✅ Cleared all scroll contexts")
+            return True
+        except Exception as e:
+            print(f"    ⚠️ Failed to clear all scroll contexts: {e}")
+            return False
+    
+    def check_cluster_health(self) -> Dict[str, Any]:
+        """Check ES cluster health and return status info"""
+        try:
+            # Get cluster health
+            health = self.client.cluster.health()
+            
+            # Get basic node info
+            info = self.client.info()
+            
+            # Get cluster stats for memory info
+            stats = self.client.cluster.stats()
+            
+            return {
+                'status': 'healthy',
+                'cluster_name': info.get('cluster_name', 'unknown'),
+                'version': info.get('version', {}).get('number', 'unknown'),
+                'health_status': health.get('status', 'unknown'),
+                'active_shards': health.get('active_shards', 0),
+                'nodes': {
+                    'total': health.get('number_of_nodes', 0),
+                    'data': health.get('number_of_data_nodes', 0)
+                },
+                'memory_usage': stats.get('nodes', {}).get('jvm', {}).get('mem', {}),
+                'indices_count': health.get('active_primary_shards', 0)
+            }
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
+    
+    def is_cluster_ready_for_import(self) -> bool:
+        """Check if cluster is ready for large import operations"""
+        health_info = self.check_cluster_health()
+        
+        if health_info['status'] != 'healthy':
+            print(f"    ❌ Cluster unhealthy: {health_info.get('error', 'Unknown error')}")
+            return False
+        
+        # Check cluster status
+        if health_info['health_status'] not in ['green', 'yellow']:
+            print(f"    ⚠️ Cluster status: {health_info['health_status']} (not green/yellow)")
+            return False
+        
+        # Check if we have data nodes
+        if health_info['nodes']['data'] == 0:
+            print(f"    ❌ No data nodes available")
+            return False
+        
+        print(f"    ✅ Cluster ready: {health_info['health_status']} status, {health_info['nodes']['total']} nodes")
+        return True
+
     def count_documents(self, index: str, query: Optional[Dict[str, Any]] = None) -> int:
         """Count documents in an index"""
         body = {"query": query} if query else {"query": {"match_all": {}}}

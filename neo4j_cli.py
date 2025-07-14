@@ -507,17 +507,35 @@ class Neo4jCLI:
                                     sample_size: int = 1000, 
                                     batch_size: int = 1000,
                                     entity_types: list = None) -> Dict[str, BaseStreamingExtractor]:
-        """Prepare streaming extractors"""
+        """Prepare streaming extractors with entity-specific batch sizes"""
         try:
             print("📡 Preparing streaming extractors...")
-            print(f"   Batch size: {batch_size}")
+            
+            # Entity-specific batch sizes optimized for ES performance
+            entity_batch_sizes = {
+                'organizations': 500,    # Simple structure, 18K docs
+                'persons': 250,          # Medium complexity, 196K docs
+                'serials': 500,          # Simple structure, 41K docs
+                'projects': 100,         # Complex nested data
+                'publications': 200      # Medium complexity
+            }
+            
+            # Use custom batch sizes for full import, fallback to provided batch_size for sample mode
+            if sample_mode:
+                print(f"   Sample mode: Using uniform batch size: {batch_size}")
+                batch_sizes = {entity: batch_size for entity in entity_batch_sizes.keys()}
+            else:
+                print("   Full import mode: Using optimized batch sizes:")
+                batch_sizes = entity_batch_sizes
+                for entity, size in entity_batch_sizes.items():
+                    print(f"     {entity}: {size}")
             
             all_extractors = {
-                'persons': PersonExtractor(self.es_client, batch_size=batch_size),
-                'organizations': OrganizationExtractor(self.es_client, batch_size=batch_size),
-                'publications': PublicationExtractor(self.es_client, batch_size=batch_size),
-                'projects': ProjectExtractor(self.es_client, batch_size=batch_size),
-                'serials': SerialExtractor(self.es_client, batch_size=batch_size),
+                'persons': PersonExtractor(self.es_client, batch_size=batch_sizes['persons']),
+                'organizations': OrganizationExtractor(self.es_client, batch_size=batch_sizes['organizations']),
+                'publications': PublicationExtractor(self.es_client, batch_size=batch_sizes['publications']),
+                'projects': ProjectExtractor(self.es_client, batch_size=batch_sizes['projects']),
+                'serials': SerialExtractor(self.es_client, batch_size=batch_sizes['serials']),
             }
             
             # Filter extractors based on entity_types if specified
